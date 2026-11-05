@@ -20,6 +20,16 @@ VOTE_TYPES = {
     "Result.Abstention": "0",
 }
 
+# Corrections to votes and voting intentions, declared by the members after the vote.
+# Their format changed at the end of 2019: <CorrectionResult.Titles> before, <Intentions> after.
+# They are not part of the documents before 2018.
+CORRECTIONS = {
+    "Intentions": "Intentions.Result.",
+    "CorrectionResult.Titles": "CorrectionResult.",
+}
+CORRECTION_TYPES = {"For": "+", "Against": "-", "Abstention": "0"}
+MEMBER_TAGS = ("PoliticalGroup.Member.Name", "Member.Name")
+
 
 def get_roll_call_votes_xml_at_date(date: str) -> etree._Element | None:
     """
@@ -58,6 +68,8 @@ class MembersSelector:
         meps = get_meps(parliamentary_term, country)
         self.ids = {mep["identifier"] for mep in meps}
         self.names = set()
+        # Normalized name => identifier of the member, None if several members have this name
+        self.__identifiers = {}
         if parliamentary_term >= 9:
             return  # The members are identified by their PersId
         normalize = self.__normalize
@@ -65,11 +77,15 @@ class MembersSelector:
                               if mep["identifier"] not in self.ids}
         for mep in meps:
             family_name, given_name = normalize(mep.get("familyName", "")), normalize(mep.get("givenName", ""))
-            self.names |= {family_name, f"{family_name} {given_name}", f"{given_name} {family_name}"}
+            names = {family_name, f"{family_name} {given_name}", f"{given_name} {family_name}"}
             # Compound family names are sometimes shortened ("Letard-Lechevalier" is "Lechevalier")
             parts = family_name.split()
             if len(parts) > 1:
-                self.names |= {part for part in parts if len(part) > 3 and part not in other_family_names}
+                names |= {part for part in parts if len(part) > 3 and part not in other_family_names}
+            self.names |= names
+            for name in names:
+                known = self.__identifiers.get(name, mep["identifier"])
+                self.__identifiers[name] = mep["identifier"] if known == mep["identifier"] else None
 
     @staticmethod
     def __normalize(name: str) -> str:
@@ -79,6 +95,16 @@ class MembersSelector:
         if member.get("PersId") is not None:
             return member.get("PersId") in self.ids
         return self.__normalize(member.text or "") in self.names
+
+    def identifier(self, member: etree._Element) -> str:
+        """
+        Identifier of a selected member, the same in the votes and in the corrections, where the names are not
+        written the same way before 2019 ("Bay" in the votes, "Nicolas Bay" in the corrections)
+        """
+        if member.get("PersId") is not None:
+            return member.get("PersId")
+        name = self.__normalize(member.text or "")
+        return self.__identifiers.get(name) or name
 
 
 def __parse_vote(vote: etree._Element, members: MembersSelector) -> dict:
@@ -98,13 +124,64 @@ def __parse_vote(vote: etree._Element, members: MembersSelector) -> dict:
         for group in element.findall("Result.PoliticalGroup.List"):
             names = [member.text.strip() for member in group
                      # The tag is "Member.Name" in some documents of 2018 and 2019
-                     if member.tag in ("PoliticalGroup.Member.Name", "Member.Name")
+                     if member.tag in MEMBER_TAGS
                      if member in members]
             if names:
                 groups[unidecode(f"{COUNTRY_NAME} / {group.get('Identifier')} :")] = names
         if groups:
             results[vote_type] = groups
     return results
+
+
+def __cast_votes(vote: etree._Element, members: MembersSelector) -> dict:
+    """
+    Votes of the selected members for one roll-call vote
+    :return: {<member identifier>: {"name": ..., "group": "France / <group> :", "vote": "+" | "-" | "0"}}
+    """
+    cast_votes = {}
+    for tag, vote_type in VOTE_TYPES.items():
+        for group in vote.findall(f"{tag}/Result.PoliticalGroup.List"):
+            for member in group:
+                if member.tag in MEMBER_TAGS and member in members:
+                    cast_votes[members.identifier(member)] = {
+                        "name": member.text.strip(),
+                        "group": unidecode(f"{COUNTRY_NAME} / {group.get('Identifier')} :"),
+                        "vote": vote_type,
+                    }
+    return cast_votes
+
+
+def __parse_corrections(vote: etree._Element, members: MembersSelector, day_members: dict) -> list[dict]:
+    """
+    Corrections and voting intentions of the selected members for one roll-call vote: members who pressed the
+    wrong button, or who did not manage to vote. They do not change the result of the vote.
+    :param vote: <RollCallVote.Result> element
+    :param members: members to keep
+    :param day_members: {<member identifier>: {"name": ..., "group": ...}} for all the votes of the day, to find the
+    name and the group of the members who did not vote
+    :return: [{"name": ..., "group": ..., "voted": "+" | "-" | "0" | None, "intended": "+" | "-" | "0"}]
+    """
+    cast_votes = __cast_votes(vote, members)
+    corrections = []
+    for container_tag, prefix in CORRECTIONS.items():
+        container = vote.find(container_tag)
+        if container is None:
+            continue
+        for suffix, intended in CORRECTION_TYPES.items():
+            for member in container.iterfind(f"{prefix}{suffix}/Member.Name"):
+                if not (member.text or "").strip() or member not in members:
+                    continue
+                identifier = members.identifier(member)
+                cast_vote = cast_votes.get(identifier) or day_members.get(identifier, {})
+                if cast_vote.get("vote") == intended:
+                    continue  # Nothing to correct
+                corrections.append({
+                    "name": cast_vote.get("name", member.text.strip()),
+                    "group": cast_vote.get("group"),
+                    "voted": cast_votes.get(identifier, {}).get("vote"),
+                    "intended": intended,
+                })
+    return corrections
 
 
 def __votes_count(vote: etree._Element) -> dict:
@@ -116,7 +193,8 @@ def __votes_count(vote: etree._Element) -> dict:
     return counts
 
 
-def __amendment(vote: etree._Element, description: str, eu_document_code: str, members: MembersSelector) -> dict:
+def __amendment(vote: etree._Element, description: str, eu_document_code: str, members: MembersSelector,
+                day_members: dict) -> dict:
     """
     Description of one roll-call vote on a document (amendment, paragraph, final vote, ...)
     The result (adopted or not) is not part of the roll-call votes results, it comes from the votes results.
@@ -133,6 +211,7 @@ def __amendment(vote: etree._Element, description: str, eu_document_code: str, m
         "result": None,
         "global_votes": __votes_count(vote),
         "votes": __parse_vote(vote, members),
+        "corrections": __parse_corrections(vote, members, day_members),
     }
 
 
@@ -140,14 +219,18 @@ def parse_all_votes(xml: etree._Element, date: str) -> dict:
     """
     Parse the roll-call votes results and return the votes of the French members for each document.
     When a document was voted several times (amendments, paragraphs, ...), the last vote is kept in "votes", as it's
-    usually the vote on the whole text. All the votes on the document are listed in "amendments".
+    usually the vote on the whole text, and its corrections in "corrections". All the votes on the document are
+    listed in "amendments".
     :param xml: root of the roll-call votes results XML document
     :param date: date of the votes as iso formatted string
-    :return: {<eu_document_code>: {"votes": {...}, "amendments": [...]}}
+    :return: {<eu_document_code>: {"votes": {...}, "corrections": [...], "amendments": [...]}}
     """
     members = MembersSelector(parliament_number_from_date(date), COUNTRY)
     votes = [(vote, __text(vote.find("RollCallVote.Description.Text")))
              for vote in xml.iter("RollCallVote.Result")]
+    # Name and group of each member who voted on this day
+    day_members = {identifier: cast_vote for vote, _ in votes
+                   for identifier, cast_vote in __cast_votes(vote, members).items()}
 
     all_documents = set()
     for _, description in votes:
@@ -159,10 +242,12 @@ def parse_all_votes(xml: etree._Element, date: str) -> dict:
         matching_votes = [(vote, description) for vote, description in votes if regex.match(description)]
         if not matching_votes:
             continue
+        amendments = [__amendment(vote, description, eu_document_code, members, day_members)
+                      for vote, description in matching_votes]
         votes_per_document[eu_document_code] = {
-            "votes": __parse_vote(matching_votes[-1][0], members),
-            "amendments": [__amendment(vote, description, eu_document_code, members)
-                           for vote, description in matching_votes],
+            "votes": amendments[-1]["votes"],
+            "corrections": amendments[-1]["corrections"],
+            "amendments": amendments,
         }
     return votes_per_document
 

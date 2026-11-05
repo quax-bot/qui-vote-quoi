@@ -24,12 +24,13 @@ def open_expected(date):
 
 def open_actual(date):
     """
-    Open the actual result, without the amendments which are tested separately
+    Open the actual result, without the amendments and the corrections which are tested separately
     """
     with open(actual_path(date), "r", encoding="utf-8") as f:
         data = json.load(f)
     for content in data.values():
         content.pop("amendments", None)
+        content.pop("corrections", None)
     return data
 
 
@@ -102,3 +103,14 @@ def test_amendments():
         "C9-0185/2022 - Proposition de la Commission",
     ]
     assert all(amendment["votes"] != {} and amendment["result"] is None for amendment in amendments)
+
+
+def test_corrections():
+    clear_database()
+
+    dump_day_to_json("2026-10-21", True, False)
+    with open(actual_path("2026-10-21"), "r", encoding="utf-8") as f:
+        data = json.load(f)
+    assert {"name": "Farreng", "group": "France / Renew :", "voted": "-", "intended": "+"} \
+           in data["A10-0258/2026"]["corrections"]
+    assert all("corrections" in amendment for content in data.values() for amendment in content["amendments"])

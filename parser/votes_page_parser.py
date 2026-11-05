@@ -117,6 +117,7 @@ def __structured_amendment(voting: etree._Element) -> dict:
         "result": voting.get("result"),
         "global_votes": result.get("global_votes"),
         "votes": {},
+        "corrections": [],
     }
 
 

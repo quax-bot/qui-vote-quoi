@@ -62,6 +62,18 @@ elles sont réessayées automatiquement et leur nombre est affiché à la fin : 
 Chaque texte contient aussi la liste `amendments` de tous les votes qui ont eu lieu dessus (amendements, paragraphes,
 vote final). Depuis 2024, le résultat de chaque vote est connu ; avant, seuls les votes par appel nominal sont listés.
 
+Les corrections de vote (députés qui se sont trompés de bouton ou n'ont pas pu voter, et qui le signalent après le
+vote) sont enregistrées dans `corrections`, pour le vote final de chaque texte et pour chaque amendement. Chaque
+correction donne le nom du député, son groupe, ce qu'il a voté (`null` s'il n'a pas voté) et ce qu'il voulait voter.
+Elles ne changent pas le résultat officiel du vote. Elles ne sont publiées que depuis 2018.
+
+La fonction `get_vote_corrections` de `database/database_reader.py` donne les corrections d'un vote :
+```python
+get_vote_corrections("A10-0258/2026", "2026-10-21")  # vote final sur le texte
+get_vote_corrections("A10-0258/2026", "2026-10-21", vote_id)  # un vote précis, identifiant pris dans `amendments`
+# [{"name": "Farreng", "group": "France / Renew :", "voted": "-", "intended": "+"}]
+```
+
 ## Mise à jour automatique de la base de données quotidiennement
 
 Pour la mise à jour automatique de votre base de données, vous pouvez lancer
